@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 packed_simd = "0.3.3"
+cfg-if = "0.1.10"
