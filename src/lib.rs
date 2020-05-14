@@ -1,7 +1,6 @@
 #![feature(test)]
 
 use cfg_if::cfg_if;
-use packed_simd::i32x8;
 
 #[inline]
 pub fn sum_scalar(x: &[i32]) -> i32 {
@@ -11,8 +10,9 @@ pub fn sum_scalar(x: &[i32]) -> i32 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub fn sum_simd_avx2(x: &[i32]) -> i32 {
-    debug_assert!(std::is_x86_feature_detected!("avx2"));
+pub fn sum_avx2(x: &[i32]) -> i32 {
+    use packed_simd::i32x8;
+    debug_assert!(is_x86_feature_detected!("avx2"));
     debug_assert_eq!(x.len() % 8, 0);
     x.chunks_exact(i32x8::lanes())
         .map(i32x8::from_slice_unaligned)
@@ -26,9 +26,9 @@ pub fn sum(x: &[i32], simd_preferred: bool) -> i32 {
     if simd_preferred {
         cfg_if! {
             if #[cfg(target_arch = "x86_64")] {
-                if std::is_x86_feature_detected!("avx2") {
+                if is_x86_feature_detected!("avx2") {
                     // println!("sum_simd_avx2");
-                    return sum_simd_avx2(x)
+                    return sum_avx2(x)
                 }
             }
         }
@@ -36,6 +36,57 @@ pub fn sum(x: &[i32], simd_preferred: bool) -> i32 {
 
     // println!("sum_scalar");
     sum_scalar(x)
+}
+
+#[inline]
+pub fn bit_count_u8_scalar(u: u8) -> u32 {
+    u.count_ones()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn bit_count_u8_avx2(u: u8) -> u32 {
+    use packed_simd::u8x2;
+    debug_assert!(is_x86_feature_detected!("avx2"));
+    let s = u8x2::new(u, 0);
+    unsafe { s.count_ones().extract_unchecked(0) as u32 }
+}
+
+#[inline]
+pub fn bit_count_u8_slice_scalar(u: &[u8]) -> u32 {
+    debug_assert_eq!(u.len() % 32, 0);
+    u.iter().fold(0, |count, &u| count + u.count_ones())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn bit_count_u8_slice_avx2(u: &[u8]) -> u32 {
+    use packed_simd::{u16x16, u8x16, u8x32};
+    use std::mem::MaybeUninit;
+    debug_assert!(is_x86_feature_detected!("avx2"));
+    debug_assert_eq!(u.len() % 32, 0);
+
+    if u.len() < 256 {
+        u.chunks_exact(u8x32::lanes())
+            .map(|s| unsafe { u8x32::from_slice_unaligned_unchecked(s).count_ones() })
+            .sum::<u8x32>()
+            .wrapping_sum() as u32
+    } else if u.len() < 1024 * 8 * 16 {
+        let mut buf = unsafe { MaybeUninit::<[u16; 16]>::uninit().assume_init() };
+        let result = u
+            .chunks_exact(u8x16::lanes())
+            .map(|s| unsafe { u8x16::from_slice_unaligned_unchecked(s).count_ones() })
+            .map(Into::<u16x16>::into)
+            .sum::<u16x16>();
+        unsafe {
+            result.write_to_slice_unaligned_unchecked(&mut buf);
+        }
+
+        buf.iter().fold(0, |count, &u| count + u as u32)
+    } else {
+        // Sum may be overflowed when length of `u` >= 128K, so panic!
+        panic!("u.len()[{}] >= 1024 * 8 * 16", u.len())
+    }
 }
 
 #[cfg(test)]
@@ -46,17 +97,17 @@ mod tests {
     use test::Bencher;
 
     #[test]
-    fn test_scalar() {
+    fn test_sum_scalar() {
         let x = [0, 1, 2, 3, 4, 5, 6, 7];
         assert_eq!(sum_scalar(&x), 28);
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_simd_avx2() {
+    fn test_sum_avx2() {
         if std::is_x86_feature_detected!("avx2") {
             let x = [0, 1, 2, 3, 4, 5, 6, 7];
-            assert_eq!(sum_simd_avx2(&x), 28);
+            assert_eq!(sum_avx2(&x), 28);
         }
     }
 
@@ -67,30 +118,84 @@ mod tests {
         assert_eq!(sum(&x, false), 28);
     }
 
-    fn build_vector(len: u32) -> Vec<i32> {
+    #[test]
+    fn test_bit_count_u8_scalar() {
+        let slow_bit_count = |n: u8| -> u32 {
+            let mut count = 0;
+            let mut i = n;
+            while i != 0 {
+                count += (i & 1) as u32;
+                i = i >> 1;
+            }
+            count
+        };
+
+        for i in 0..=255u8 {
+            assert_eq!(bit_count_u8_scalar(i), slow_bit_count(i));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_bit_count_u8_avx2() {
+        for i in 0..=255u8 {
+            assert_eq!(bit_count_u8_avx2(i), bit_count_u8_scalar(i));
+        }
+    }
+
+    #[test]
+    fn test_bit_count_u8_slice_scalar() {
+        let slow_bit_count =
+            |n: &[u8]| -> u32 { n.iter().fold(0, |count, &u| count + bit_count_u8_scalar(u)) };
+
+        #[rustfmt::skip]
+        let s = [
+            0u8, 1, 2, 3, 4, 5, 6, 7,
+            8, 9, 10, 11, 12, 13, 14, 15,
+            16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31
+        ];
+
+        assert_eq!(bit_count_u8_slice_scalar(&s), slow_bit_count(&s));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_bit_count_u8_slice_avx2() {
+        let s = build_u8_vector(256);
+        assert_eq!(bit_count_u8_slice_avx2(&s), bit_count_u8_slice_scalar(&s));
+    }
+
+    fn build_i32_vector(len: u32) -> Vec<i32> {
         debug_assert_eq!(len % 8, 0);
         (0..len as i32).collect()
     }
 
+    fn build_u8_vector(len: u32) -> Vec<u8> {
+        debug_assert_eq!(len % 32, 0);
+        vec![255; len as usize]
+    }
+
     #[bench]
-    fn bench_scalar(b: &mut Bencher) {
-        let x = build_vector(6400);
+    fn bench_sum_scalar(b: &mut Bencher) {
+        let x = build_i32_vector(6400);
         b.iter(|| {
             test::black_box(sum_scalar(test::black_box(&x)));
         });
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[bench]
-    fn bench_avx2(b: &mut Bencher) {
-        let x = build_vector(6400);
+    fn bench_sum_avx2(b: &mut Bencher) {
+        let x = build_i32_vector(6400);
         b.iter(|| {
-            test::black_box(sum_simd_avx2(test::black_box(&x)));
+            test::black_box(sum_avx2(test::black_box(&x)));
         });
     }
 
     #[bench]
     fn bench_sum_true(b: &mut Bencher) {
-        let x = build_vector(6400);
+        let x = build_i32_vector(6400);
         b.iter(|| {
             test::black_box(sum(test::black_box(&x), true));
         });
@@ -98,9 +203,43 @@ mod tests {
 
     #[bench]
     fn bench_sum_false(b: &mut Bencher) {
-        let x = build_vector(6400);
+        let x = build_i32_vector(6400);
         b.iter(|| {
             test::black_box(sum(test::black_box(&x), false));
+        });
+    }
+
+    #[bench]
+    fn bench_bit_count_u8_scalar(b: &mut Bencher) {
+        let u = 255u8;
+        b.iter(|| {
+            test::black_box(bit_count_u8_scalar(test::black_box(u)));
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[bench]
+    fn bench_bit_count_u8_avx2(b: &mut Bencher) {
+        let u = 255u8;
+        b.iter(|| {
+            test::black_box(bit_count_u8_avx2(test::black_box(u)));
+        })
+    }
+
+    #[bench]
+    fn bench_bit_count_u8_slice_scalar(b: &mut Bencher) {
+        let x = build_u8_vector(256);
+        b.iter(|| {
+            test::black_box(bit_count_u8_slice_scalar(test::black_box(&x)));
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[bench]
+    fn bench_bit_count_u8_slice_avx2(b: &mut Bencher) {
+        let x = build_u8_vector(256);
+        b.iter(|| {
+            test::black_box(bit_count_u8_slice_avx2(test::black_box(&x)));
         });
     }
 }
