@@ -54,8 +54,24 @@ pub fn bit_count_u8_avx2(u: u8) -> u32 {
 
 #[inline]
 pub fn bit_count_u8_slice_scalar(u: &[u8]) -> u32 {
-    debug_assert_eq!(u.len() % 32, 0);
     u.iter().fold(0, |count, &u| count + u.count_ones())
+}
+
+static BIT_COUNT_TABLE: [u8; 256] = [
+    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8,
+];
+
+#[inline]
+pub fn bit_count_u8_slice_table(u: &[u8]) -> u32 {
+    u.iter()
+        .fold(0, |count, &u| count + BIT_COUNT_TABLE[u as usize] as u32)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -64,17 +80,20 @@ pub fn bit_count_u8_slice_avx2(u: &[u8]) -> u32 {
     use packed_simd::{u16x16, u8x16, u8x32};
     use std::mem::MaybeUninit;
     debug_assert!(is_x86_feature_detected!("avx2"));
-    debug_assert_eq!(u.len() % 32, 0);
 
     if u.len() < 256 {
-        u.chunks_exact(u8x32::lanes())
+        let chunks = u.chunks_exact(u8x32::lanes());
+        let mut sum = bit_count_u8_slice_table(chunks.remainder());
+        sum += chunks
             .map(|s| unsafe { u8x32::from_slice_unaligned_unchecked(s).count_ones() })
             .sum::<u8x32>()
-            .wrapping_sum() as u32
+            .wrapping_sum() as u32;
+        sum
     } else if u.len() < 1024 * 8 * 16 {
         let mut buf = unsafe { MaybeUninit::<[u16; 16]>::uninit().assume_init() };
-        let result = u
-            .chunks_exact(u8x16::lanes())
+        let chunks = u.chunks_exact(u8x16::lanes());
+        let mut sum = bit_count_u8_slice_table(chunks.remainder());
+        let result = chunks
             .map(|s| unsafe { u8x16::from_slice_unaligned_unchecked(s).count_ones() })
             .map(Into::<u16x16>::into)
             .sum::<u16x16>();
@@ -82,7 +101,8 @@ pub fn bit_count_u8_slice_avx2(u: &[u8]) -> u32 {
             result.write_to_slice_unaligned_unchecked(&mut buf);
         }
 
-        buf.iter().fold(0, |count, &u| count + u as u32)
+        sum += buf.iter().fold(0, |count, &u| count + u as u32);
+        sum
     } else {
         // Sum may be overflowed when length of `u` >= 128K, so panic!
         panic!("u.len()[{}] >= 1024 * 8 * 16", u.len())
@@ -159,11 +179,20 @@ mod tests {
         assert_eq!(bit_count_u8_slice_scalar(&s), slow_bit_count(&s));
     }
 
+    #[test]
+    fn test_bit_count_u8_slice_table() {
+        let s = build_u8_vector(256);
+        assert_eq!(bit_count_u8_slice_table(&s), bit_count_u8_slice_scalar(&s));
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_bit_count_u8_slice_avx2() {
-        let s = build_u8_vector(256);
-        assert_eq!(bit_count_u8_slice_avx2(&s), bit_count_u8_slice_scalar(&s));
+        for n in (1u32..128) {
+            let s = build_u8_vector(n);
+            println!("{}: avx2: {}, scalar: {}", n, bit_count_u8_slice_avx2(&s), bit_count_u8_slice_scalar(&s));
+            assert_eq!(bit_count_u8_slice_avx2(&s), bit_count_u8_slice_scalar(&s));
+        }
     }
 
     fn build_i32_vector(len: u32) -> Vec<i32> {
@@ -172,7 +201,6 @@ mod tests {
     }
 
     fn build_u8_vector(len: u32) -> Vec<u8> {
-        debug_assert_eq!(len % 32, 0);
         vec![255; len as usize]
     }
 
@@ -231,6 +259,14 @@ mod tests {
         let x = build_u8_vector(256);
         b.iter(|| {
             test::black_box(bit_count_u8_slice_scalar(test::black_box(&x)));
+        });
+    }
+
+    #[bench]
+    fn bench_bit_count_u8_slice_table(b: &mut Bencher) {
+        let x = build_u8_vector(256);
+        b.iter(|| {
+            test::black_box(bit_count_u8_slice_table(test::black_box(&x)));
         });
     }
 
