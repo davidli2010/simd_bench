@@ -28,7 +28,7 @@ pub fn sum(x: &[i32], simd_preferred: bool) -> i32 {
             if #[cfg(target_arch = "x86_64")] {
                 if is_x86_feature_detected!("avx2") {
                     // println!("sum_simd_avx2");
-                    return sum_avx2(x)
+                    return sum_avx2(x);
                 }
             }
         }
@@ -77,36 +77,24 @@ pub fn bit_count_u8_slice_table(u: &[u8]) -> u32 {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn bit_count_u8_slice_avx2(u: &[u8]) -> u32 {
-    use packed_simd::{u16x16, u8x16, u8x32};
+    use packed_simd::{u16x16, u8x16};
     use std::mem::MaybeUninit;
     debug_assert!(is_x86_feature_detected!("avx2"));
+    assert!(u.len() < 1024 * 8 * 16);
 
-    if u.len() < 256 {
-        let chunks = u.chunks_exact(u8x32::lanes());
-        let mut sum = bit_count_u8_slice_table(chunks.remainder());
-        sum += chunks
-            .map(|s| unsafe { u8x32::from_slice_unaligned_unchecked(s).count_ones() })
-            .sum::<u8x32>()
-            .wrapping_sum() as u32;
-        sum
-    } else if u.len() < 1024 * 8 * 16 {
-        let mut buf = unsafe { MaybeUninit::<[u16; 16]>::uninit().assume_init() };
-        let chunks = u.chunks_exact(u8x16::lanes());
-        let mut sum = bit_count_u8_slice_table(chunks.remainder());
-        let result = chunks
-            .map(|s| unsafe { u8x16::from_slice_unaligned_unchecked(s).count_ones() })
-            .map(Into::<u16x16>::into)
-            .sum::<u16x16>();
-        unsafe {
-            result.write_to_slice_unaligned_unchecked(&mut buf);
-        }
-
-        sum += buf.iter().fold(0, |count, &u| count + u as u32);
-        sum
-    } else {
-        // Sum may be overflowed when length of `u` >= 128K, so panic!
-        panic!("u.len()[{}] >= 1024 * 8 * 16", u.len())
-    }
+    let chunks = u.chunks_exact(u8x16::lanes());
+    let mut sum = bit_count_u8_slice_table(chunks.remainder());
+    let result = chunks
+        .map(|s| unsafe { u8x16::from_slice_unaligned_unchecked(s).count_ones() })
+        .map(Into::<u16x16>::into)
+        .sum::<u16x16>();
+    let result = unsafe {
+        let mut buf = MaybeUninit::<[u16; 16]>::uninit().assume_init();
+        result.write_to_slice_unaligned_unchecked(&mut buf);
+        buf
+    };
+    sum += result.iter().fold(0, |count, &u| count + u as u32);
+    sum
 }
 
 #[cfg(test)]
@@ -188,9 +176,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_bit_count_u8_slice_avx2() {
-        for n in (1u32..128) {
-            let s = build_u8_vector(n);
-            println!("{}: avx2: {}, scalar: {}", n, bit_count_u8_slice_avx2(&s), bit_count_u8_slice_scalar(&s));
+        let v = vec![255u8; 1024 * 128];
+        for n in 1usize..1024 * 128 {
+            let s = &v[0..n];
             assert_eq!(bit_count_u8_slice_avx2(&s), bit_count_u8_slice_scalar(&s));
         }
     }
